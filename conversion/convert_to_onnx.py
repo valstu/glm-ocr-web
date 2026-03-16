@@ -308,7 +308,7 @@ def try_direct_export(
 
         # ── Export vision encoder ──
         log("Exporting vision encoder...")
-        vision_exported = _export_vision_encoder(model, onnx_dir, torch_dtype)
+        vision_exported = _export_vision_encoder(model, processor, onnx_dir, torch_dtype)
 
         # ── Export language model ──
         log("Exporting language model decoder...")
@@ -328,11 +328,17 @@ def try_direct_export(
         return False
 
 
-def _export_vision_encoder(model, onnx_dir: Path, torch_dtype) -> bool:
-    """Export the CogViT visual encoder to ONNX."""
+def _export_vision_encoder(model, processor, onnx_dir: Path, torch_dtype) -> bool:
+    """Export the GLM-OCR visual encoder to ONNX.
+
+    GLM-OCR uses a Qwen2.5-VL / GLM-4.6V style ViT that takes:
+      pixel_values : (num_patches, C * temporal_patch_size * patch_h * patch_w)
+      grid_thw     : (num_images, 3)  — temporal, height, width in patch units
+    Both tensors come from the processor; we must NOT use raw NCHW dummies.
+    """
     import torch
 
-    # Try to find the vision tower
+    # ── Locate vision tower ──
     vision_module = None
     for attr in ["vision_tower", "visual", "vision_model", "image_encoder"]:
         m = getattr(model.model if hasattr(model, "model") else model, attr, None)
@@ -342,7 +348,6 @@ def _export_vision_encoder(model, onnx_dir: Path, torch_dtype) -> bool:
             break
 
     if vision_module is None:
-        # Look one level deeper
         if hasattr(model, "model"):
             for name, mod in model.model.named_children():
                 if any(x in name.lower() for x in ["vision", "visual", "cog", "vit"]):
@@ -354,7 +359,7 @@ def _export_vision_encoder(model, onnx_dir: Path, torch_dtype) -> bool:
         log("Could not locate vision encoder module", "WARN")
         return False
 
-    # Also get the connector/projector
+    # ── Locate connector ──
     connector = None
     for attr in ["multi_modal_projector", "mm_projector", "connector", "image_projection"]:
         c = getattr(model.model if hasattr(model, "model") else model, attr, None)
@@ -363,7 +368,52 @@ def _export_vision_encoder(model, onnx_dir: Path, torch_dtype) -> bool:
             log(f"Found connector: .{attr}")
             break
 
-    class VisionEncoderWithConnector(torch.nn.Module):
+    # ── Get real pixel_values + grid_thw from processor ──
+    # GLM-4.6V / Qwen2.5-VL processors return:
+    #   pixel_values : (num_patches, channels_per_patch)  — NOT NCHW
+    #   image_grid_thw: (num_images, 3)
+    dummy_image = create_dummy_image(448)
+    proc_out = None
+    for text in [
+        "<|user|>\n<|vision_start|><|image_pad|><|vision_end|>\nDescribe<|assistant|>\n",
+        "Describe the image",
+        "",
+    ]:
+        try:
+            kw = dict(images=dummy_image, return_tensors="pt")
+            if text:
+                kw["text"] = text
+            proc_out = processor(**kw)
+            if "pixel_values" in proc_out:
+                break
+        except Exception:
+            continue
+
+    if proc_out is None or "pixel_values" not in proc_out:
+        log("Processor did not return pixel_values — cannot export vision encoder", "WARN")
+        return False
+
+    pixel_values = proc_out["pixel_values"].to(torch_dtype)
+    # key varies: image_grid_thw (Qwen2.5-VL) or grid_thw
+    grid_thw = proc_out.get("image_grid_thw", proc_out.get("grid_thw", None))
+    log(f"pixel_values: {tuple(pixel_values.shape)}  grid_thw: {grid_thw}")
+
+    has_grid = grid_thw is not None
+
+    class VisionEncoderWrapper(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.vision = vision_module
+            self.connector = connector
+
+        def forward(self, pixel_values, grid_thw):
+            out = self.vision(pixel_values, grid_thw=grid_thw)
+            feat = out.last_hidden_state if hasattr(out, "last_hidden_state") else out[0]
+            if self.connector is not None:
+                feat = self.connector(feat)
+            return feat
+
+    class VisionEncoderWrapperNoGrid(torch.nn.Module):
         def __init__(self):
             super().__init__()
             self.vision = vision_module
@@ -376,24 +426,48 @@ def _export_vision_encoder(model, onnx_dir: Path, torch_dtype) -> bool:
                 feat = self.connector(feat)
             return feat
 
-    wrapper = VisionEncoderWithConnector().eval()
-    dummy = torch.zeros(1, 3, 448, 448, dtype=torch_dtype)
-
     onnx_path = onnx_dir / "vision_encoder.onnx"
-    with torch.no_grad():
-        torch.onnx.export(
-            wrapper,
-            (dummy,),
-            str(onnx_path),
-            input_names=["pixel_values"],
-            output_names=["image_embeds"],
-            dynamic_axes={
-                "pixel_values": {0: "batch_size"},
-                "image_embeds": {0: "batch_size", 1: "seq_len"},
-            },
-            opset_version=17,
-            do_constant_folding=True,
-        )
+    try:
+        with torch.no_grad():
+            if has_grid:
+                wrapper = VisionEncoderWrapper().eval()
+                torch.onnx.export(
+                    wrapper,
+                    (pixel_values, grid_thw),
+                    str(onnx_path),
+                    dynamo=False,           # legacy TorchScript exporter — more stable
+                    input_names=["pixel_values", "grid_thw"],
+                    output_names=["image_embeds"],
+                    dynamic_axes={
+                        "pixel_values": {0: "num_patches"},
+                        "grid_thw":     {0: "num_images"},
+                        "image_embeds": {0: "num_tokens"},
+                    },
+                    opset_version=17,
+                    do_constant_folding=True,
+                )
+            else:
+                wrapper = VisionEncoderWrapperNoGrid().eval()
+                torch.onnx.export(
+                    wrapper,
+                    (pixel_values,),
+                    str(onnx_path),
+                    dynamo=False,
+                    input_names=["pixel_values"],
+                    output_names=["image_embeds"],
+                    dynamic_axes={
+                        "pixel_values": {0: "num_patches"},
+                        "image_embeds": {0: "num_tokens"},
+                    },
+                    opset_version=17,
+                    do_constant_folding=True,
+                )
+    except Exception as e:
+        log(f"Vision encoder export failed: {e}", "WARN")
+        if os.environ.get("DEBUG"):
+            traceback.print_exc()
+        return False
+
     log(f"Vision encoder: {onnx_path.name} ({fmt_mb(onnx_path)})", "OK")
     return True
 
@@ -422,6 +496,7 @@ def _export_language_model(model, processor, onnx_dir: Path, torch_dtype) -> boo
                 wrapper,
                 (dummy_ids, dummy_mask),
                 str(onnx_path),
+                dynamo=False,
                 input_names=["input_ids", "attention_mask"],
                 output_names=["logits"],
                 dynamic_axes={
