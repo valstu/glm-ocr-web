@@ -1,0 +1,117 @@
+name: Convert GLM-OCR to ONNX
+
+# Trigger manually with configurable inputs
+on:
+  workflow_dispatch:
+    inputs:
+      hf_repo_id:
+        description: 'HuggingFace repo to push ONNX model to (e.g. YOUR_USERNAME/GLM-OCR-ONNX)'
+        required: true
+        default: 'onnx-community/GLM-OCR'
+      dtype:
+        description: 'Quantization type'
+        required: true
+        default: 'int4'
+        type: choice
+        options: [int4, int8, fp16, fp32]
+      source_model:
+        description: 'Source model ID on HuggingFace'
+        required: true
+        default: 'zai-org/GLM-OCR'
+
+jobs:
+  convert:
+    name: Convert → ONNX (${{ inputs.dtype }})
+    runs-on: ubuntu-latest
+
+    steps:
+      # ── Checkout ──────────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── Free up disk space ────────────────────────────────────────────────
+      # The 0.9B model + conversion artifacts need ~15 GB
+      - name: Free disk space
+        run: |
+          echo "Before cleanup:"
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/share/boost /usr/share/swift /opt/hostedtoolcache/CodeQL \
+            /usr/lib/jvm /usr/share/ruby-build
+          sudo apt-get clean
+          echo "After cleanup:"
+          df -h /
+
+      # ── Python setup ─────────────────────────────────────────────────────
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      # ── Install dependencies ──────────────────────────────────────────────
+      - name: Install Python dependencies
+        run: |
+          pip install --upgrade pip
+          # Core ML stack
+          pip install "transformers>=5.3.0"
+          # CPU-only torch (smaller, no CUDA needed for export)
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          # ONNX toolchain
+          pip install onnx "onnxruntime>=1.20" onnxconverter-common
+          # optimum with ONNX exporters
+          pip install "optimum[onnxruntime]"
+          # Fast HF Hub downloads
+          pip install "huggingface_hub[hf_transfer]" hf_transfer
+          pip install Pillow numpy
+          # Check versions
+          python -c "import transformers; print('transformers:', transformers.__version__)"
+          python -c "import onnx; print('onnx:', onnx.__version__)"
+          python -c "import optimum; print('optimum installed')"
+
+      # ── Run conversion ────────────────────────────────────────────────────
+      - name: Convert GLM-OCR to ONNX
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_HUB_ENABLE_HF_TRANSFER: "1"
+          HF_HOME: /tmp/hf_cache
+        run: |
+          python conversion/convert_to_onnx.py \
+            --model "${{ inputs.source_model }}" \
+            --output ./onnx_output \
+            --quantize "${{ inputs.dtype }}" \
+            --push_to_hub "${{ inputs.hf_repo_id }}"
+
+      # ── Upload artifact (backup if push fails) ────────────────────────────
+      - name: Upload ONNX artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: glm-ocr-onnx-${{ inputs.dtype }}
+          path: onnx_output/
+          retention-days: 7
+          if-no-files-found: warn
+
+      # ── Summary ───────────────────────────────────────────────────────────
+      - name: Write job summary
+        if: always()
+        run: |
+          echo "## GLM-OCR ONNX Conversion" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Setting | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|---------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Source model | \`${{ inputs.source_model }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Output repo | \`${{ inputs.hf_repo_id }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Quantization | \`${{ inputs.dtype }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ -d onnx_output ]; then
+            echo "### Output files" >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+            find onnx_output -type f | sort | while read f; do
+              size=$(du -h "$f" | cut -f1)
+              echo "$size  $f"
+            done >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "⚠️ No output files found." >> $GITHUB_STEP_SUMMARY
+          fi

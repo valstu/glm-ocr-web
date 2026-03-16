@@ -3,285 +3,538 @@ GLM-OCR → ONNX Conversion Script
 ==================================
 Converts zai-org/GLM-OCR to ONNX format compatible with transformers.js + WebGPU.
 
-Requirements:
-    pip install transformers>=5.3.0 torch optimum[onnxruntime] onnx onnxruntime
-    pip install huggingface_hub[hf_transfer]
+Tries three approaches in order:
+  1. optimum with a custom GlmOcr ONNX config (best — transformers.js compatible)
+  2. onnxruntime-genai model builder (good for on-device genai)
+  3. Direct torch.onnx.export fallback (basic, may not support autoregressive generation)
+
+Requirements (install with pip):
+    pip install "transformers>=5.3.0" torch onnx "onnxruntime>=1.20" "optimum[onnxruntime]"
+    pip install "huggingface_hub[hf_transfer]" Pillow numpy
 
 Usage:
-    python convert_to_onnx.py --output ./onnx_output
-    python convert_to_onnx.py --output ./onnx_output --quantize int4
-    python convert_to_onnx.py --output ./onnx_output --push_to_hub YOUR_HF_USERNAME/GLM-OCR-ONNX
+    # Basic conversion + INT4 quantize
+    python convert_to_onnx.py --output ./onnx_out --quantize int4
 
-After conversion, run the app locally to test:
-    cd .. && npm run dev
+    # Convert and push to HuggingFace Hub
+    python convert_to_onnx.py --output ./onnx_out --quantize int4 \\
+        --push_to_hub YOUR_USERNAME/GLM-OCR-ONNX
 """
 
 import argparse
 import json
 import os
 import shutil
+import sys
+import traceback
 from pathlib import Path
+from typing import Optional
 
-import torch
 import numpy as np
 from PIL import Image
 
 
-def load_model(model_id: str = "zai-org/GLM-OCR", dtype=torch.float32):
-    from transformers import AutoProcessor, AutoModelForImageTextToText
-    print(f"[*] Loading model: {model_id}")
-    processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
-    model = AutoModelForImageTextToText.from_pretrained(
-        model_id,
-        torch_dtype=dtype,
-        device_map="cpu",
-        trust_remote_code=True,
-    )
-    model.eval()
-    print(f"[+] Model loaded. Parameters: {sum(p.numel() for p in model.parameters()) / 1e9:.2f}B")
-    return processor, model
+# ── Helpers ────────────────────────────────────────────────────────────────
+
+def log(msg: str, level: str = "INFO"):
+    prefix = {"INFO": "[*]", "OK": "[+]", "WARN": "[!]", "ERR": "[✗]"}.get(level, "[?]")
+    print(f"{prefix} {msg}", flush=True)
 
 
-def create_dummy_inputs(processor, image_size=448):
-    """Create dummy inputs for ONNX tracing."""
-    dummy_image = Image.fromarray(
-        np.random.randint(0, 255, (image_size, image_size, 3), dtype=np.uint8)
+def fmt_mb(path: Path) -> str:
+    if path.exists():
+        return f"{path.stat().st_size / 1e6:.1f} MB"
+    return "N/A"
+
+
+def create_dummy_image(size: int = 448) -> Image.Image:
+    return Image.fromarray(
+        np.random.randint(0, 255, (size, size, 3), dtype=np.uint8)
     )
-    messages = [
-        {
-            "role": "user",
-            "content": [
-                {"type": "image", "image": dummy_image},
-                {"type": "text", "text": "Text Recognition:"},
-            ],
-        }
+
+
+def copy_tokenizer_files(src_dir: Path, dst_dir: Path):
+    """Copy tokenizer, config and preprocessor files needed by transformers.js."""
+    important = [
+        "config.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "special_tokens_map.json",
+        "preprocessor_config.json",
+        "generation_config.json",
+        "chat_template.jinja",
     ]
-    inputs = processor.apply_chat_template(
-        messages,
-        tokenize=True,
-        add_generation_prompt=True,
-        return_dict=True,
-        return_tensors="pt",
-    )
-    inputs.pop("token_type_ids", None)
-    return inputs, dummy_image
+    for name in important:
+        src = src_dir / name
+        if src.exists():
+            shutil.copy(src, dst_dir / name)
+            log(f"Copied {name}", "OK")
 
 
-def export_vision_encoder(model, processor, output_dir: Path):
-    """Export the vision encoder to ONNX."""
-    print("[*] Exporting vision encoder...")
-    output_dir.mkdir(parents=True, exist_ok=True)
+def patch_config_for_transformers_js(config_path: Path):
+    """Add hints that help transformers.js handle this model correctly."""
+    if not config_path.exists():
+        return
+    with open(config_path) as f:
+        cfg = json.load(f)
+    cfg.setdefault("model_type", "glm_ocr")
+    with open(config_path, "w") as f:
+        json.dump(cfg, f, indent=2)
 
-    class VisionEncoderWrapper(torch.nn.Module):
-        def __init__(self, model):
+
+# ── Approach 1: optimum with custom ONNX config ────────────────────────────
+
+def try_optimum_export(
+    model_id: str,
+    output_dir: Path,
+    dtype: str,
+) -> bool:
+    """
+    Register a custom ONNX config for glm_ocr and use optimum to export.
+    This produces files in the format transformers.js expects.
+    """
+    log("Approach 1: optimum with custom GlmOcr ONNX config")
+    try:
+        import torch
+        from transformers import AutoConfig
+        from optimum.exporters.onnx import main_export
+        from optimum.exporters.onnx.config import (
+            TextDecoderOnnxConfig,
+            VisionOnnxConfig,
+        )
+        from optimum.exporters.tasks import TasksManager
+        from optimum.utils import NormalizedTextConfig, NormalizedVisionConfig
+
+        # ── Register custom ONNX config for glm_ocr ──
+        log("Registering custom GlmOcr ONNX config...")
+
+        class GlmOcrTextConfig(TextDecoderOnnxConfig):
+            """Custom ONNX config for GLM-OCR's language decoder."""
+            NORMALIZED_CONFIG_CLASS = NormalizedTextConfig
+            DEFAULT_ONNX_OPSET = 17
+
+            @property
+            def inputs(self):
+                return {
+                    "input_ids": {0: "batch_size", 1: "sequence_length"},
+                    "attention_mask": {0: "batch_size", 1: "sequence_length"},
+                }
+
+            @property
+            def outputs(self):
+                return {"logits": {0: "batch_size", 1: "sequence_length"}}
+
+        # Try to register with the tasks manager
+        try:
+            register_fn = TasksManager.create_register("onnx", overwrite_existing=True)
+            register_fn("glm_ocr", "text-generation")(GlmOcrTextConfig)
+            register_fn("glm_ocr", "image-text-to-text")(GlmOcrTextConfig)
+            log("Custom config registered", "OK")
+        except Exception as e:
+            log(f"Registration warning (non-fatal): {e}", "WARN")
+
+        # ── Export ──
+        log(f"Running optimum export to {output_dir}...")
+        dtype_map = {"int4": "int4", "int8": "int8", "fp16": "fp16", "fp32": "fp32"}
+        onnx_dtype = dtype_map.get(dtype, "fp32")
+
+        main_export(
+            model_name_or_path=model_id,
+            output=output_dir,
+            task="image-text-to-text",
+            opset=17,
+            dtype=onnx_dtype if onnx_dtype in ("fp16", "fp32") else "fp32",
+            trust_remote_code=True,
+            library_name="transformers",
+        )
+        log("optimum export complete", "OK")
+
+        # Post-quantize if needed
+        if dtype in ("int4", "int8"):
+            _quantize_onnx_files(output_dir, dtype)
+
+        return True
+
+    except Exception as e:
+        log(f"optimum export failed: {e}", "WARN")
+        if os.environ.get("DEBUG"):
+            traceback.print_exc()
+        return False
+
+
+def _quantize_onnx_files(onnx_dir: Path, dtype: str):
+    """Quantize all ONNX files in a directory."""
+    try:
+        from onnxruntime.quantization import quantize_dynamic, QuantType
+
+        quant_type = QuantType.QInt4 if dtype == "int4" else QuantType.QInt8
+        for onnx_file in onnx_dir.glob("*.onnx"):
+            if "quantized" in onnx_file.name or "quant" in onnx_file.name:
+                continue
+            out_path = onnx_file.parent / f"{onnx_file.stem}_quantized.onnx"
+            log(f"Quantizing {onnx_file.name} → {dtype}...")
+            try:
+                quantize_dynamic(str(onnx_file), str(out_path), weight_type=quant_type)
+                log(f"Quantized: {out_path.name} ({fmt_mb(out_path)})", "OK")
+            except Exception as e:
+                log(f"Quantization of {onnx_file.name} failed: {e}", "WARN")
+    except ImportError:
+        log("onnxruntime.quantization not available, skipping quantization", "WARN")
+
+
+# ── Approach 2: onnxruntime-genai model builder ────────────────────────────
+
+def try_onnxruntime_genai(
+    model_id: str,
+    output_dir: Path,
+    dtype: str,
+) -> bool:
+    """
+    Use onnxruntime-genai's model builder — designed specifically for generative
+    models with KV-cache. Produces ONNX + GenAI config files.
+    """
+    log("Approach 2: onnxruntime-genai model builder")
+    try:
+        import subprocess
+        result = subprocess.run(
+            [sys.executable, "-c", "import onnxruntime_genai"],
+            capture_output=True,
+        )
+        if result.returncode != 0:
+            log("onnxruntime-genai not installed, installing...", "WARN")
+            subprocess.run(
+                [sys.executable, "-m", "pip", "install", "onnxruntime-genai", "-q"],
+                check=True,
+            )
+
+        precision_map = {
+            "int4": "int4",
+            "int8": "int8",
+            "fp16": "fp16",
+            "fp32": "fp32",
+        }
+        precision = precision_map.get(dtype, "int4")
+
+        genai_output = output_dir / "genai"
+        genai_output.mkdir(parents=True, exist_ok=True)
+
+        log(f"Building onnxruntime-genai model (precision={precision})...")
+        result = subprocess.run(
+            [
+                sys.executable, "-m", "onnxruntime_genai.models.builder",
+                "-m", model_id,
+                "-o", str(genai_output),
+                "-p", precision,
+                "-e", "cpu",
+                "--trust_remote_code",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=3600,
+        )
+        if result.returncode == 0:
+            log("onnxruntime-genai build complete", "OK")
+            log(result.stdout[-2000:] if result.stdout else "", "INFO")
+            return True
+        else:
+            log(f"onnxruntime-genai failed (exit {result.returncode}): {result.stderr[-1000:]}", "WARN")
+            return False
+
+    except Exception as e:
+        log(f"onnxruntime-genai approach failed: {e}", "WARN")
+        return False
+
+
+# ── Approach 3: Direct torch.onnx.export ──────────────────────────────────
+
+def try_direct_export(
+    model_id: str,
+    output_dir: Path,
+    dtype: str,
+) -> bool:
+    """
+    Export model components directly with torch.onnx.
+    Exports vision encoder and the full model forward pass.
+    """
+    log("Approach 3: Direct torch.onnx.export")
+    try:
+        import torch
+        from transformers import AutoProcessor, AutoModelForImageTextToText
+
+        torch_dtype = torch.float16 if dtype in ("fp16", "int4", "int8") else torch.float32
+
+        log(f"Loading model {model_id} (dtype={torch_dtype})...")
+        processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
+        model = AutoModelForImageTextToText.from_pretrained(
+            model_id,
+            torch_dtype=torch_dtype,
+            device_map="cpu",
+            trust_remote_code=True,
+        )
+        model.eval()
+        log(f"Model loaded ({sum(p.numel() for p in model.parameters()) / 1e9:.2f}B params)", "OK")
+
+        onnx_dir = output_dir / "onnx"
+        onnx_dir.mkdir(parents=True, exist_ok=True)
+
+        # ── Export vision encoder ──
+        log("Exporting vision encoder...")
+        vision_exported = _export_vision_encoder(model, onnx_dir, torch_dtype)
+
+        # ── Export language model ──
+        log("Exporting language model decoder...")
+        lm_exported = _export_language_model(model, processor, onnx_dir, torch_dtype)
+
+        if vision_exported or lm_exported:
+            # Quantize if needed
+            if dtype in ("int4", "int8"):
+                _quantize_onnx_files(onnx_dir, dtype)
+            return True
+        return False
+
+    except Exception as e:
+        log(f"Direct export failed: {e}", "ERR")
+        if os.environ.get("DEBUG"):
+            traceback.print_exc()
+        return False
+
+
+def _export_vision_encoder(model, onnx_dir: Path, torch_dtype) -> bool:
+    """Export the CogViT visual encoder to ONNX."""
+    import torch
+
+    # Try to find the vision tower
+    vision_module = None
+    for attr in ["vision_tower", "visual", "vision_model", "image_encoder"]:
+        m = getattr(model.model if hasattr(model, "model") else model, attr, None)
+        if m is not None:
+            vision_module = m
+            log(f"Found vision module: model.{attr}")
+            break
+
+    if vision_module is None:
+        # Look one level deeper
+        if hasattr(model, "model"):
+            for name, mod in model.model.named_children():
+                if any(x in name.lower() for x in ["vision", "visual", "cog", "vit"]):
+                    vision_module = mod
+                    log(f"Found vision module: model.model.{name}")
+                    break
+
+    if vision_module is None:
+        log("Could not locate vision encoder module", "WARN")
+        return False
+
+    # Also get the connector/projector
+    connector = None
+    for attr in ["multi_modal_projector", "mm_projector", "connector", "image_projection"]:
+        c = getattr(model.model if hasattr(model, "model") else model, attr, None)
+        if c is not None:
+            connector = c
+            log(f"Found connector: .{attr}")
+            break
+
+    class VisionEncoderWithConnector(torch.nn.Module):
+        def __init__(self):
             super().__init__()
-            self.vision_model = model.model.vision_tower
-            self.connector = model.model.multi_modal_projector
+            self.vision = vision_module
+            self.connector = connector
 
         def forward(self, pixel_values):
-            vision_out = self.vision_model(pixel_values)
-            if hasattr(vision_out, "last_hidden_state"):
-                vision_features = vision_out.last_hidden_state
-            else:
-                vision_features = vision_out[0]
-            projected = self.connector(vision_features)
-            return projected
+            out = self.vision(pixel_values)
+            feat = out.last_hidden_state if hasattr(out, "last_hidden_state") else out[0]
+            if self.connector is not None:
+                feat = self.connector(feat)
+            return feat
 
-    wrapper = VisionEncoderWrapper(model)
-    wrapper.eval()
+    wrapper = VisionEncoderWithConnector().eval()
+    dummy = torch.zeros(1, 3, 448, 448, dtype=torch_dtype)
 
-    # Create dummy pixel values
-    dummy_pixels = torch.randn(1, 3, 448, 448, dtype=torch.float32)
-
-    onnx_path = output_dir / "vision_encoder.onnx"
+    onnx_path = onnx_dir / "vision_encoder.onnx"
     with torch.no_grad():
         torch.onnx.export(
             wrapper,
-            (dummy_pixels,),
+            (dummy,),
             str(onnx_path),
             input_names=["pixel_values"],
             output_names=["image_embeds"],
             dynamic_axes={
                 "pixel_values": {0: "batch_size"},
-                "image_embeds": {0: "batch_size"},
+                "image_embeds": {0: "batch_size", 1: "seq_len"},
             },
             opset_version=17,
             do_constant_folding=True,
         )
-    print(f"[+] Vision encoder saved: {onnx_path} ({onnx_path.stat().st_size / 1e6:.1f} MB)")
-    return onnx_path
+    log(f"Vision encoder: {onnx_path.name} ({fmt_mb(onnx_path)})", "OK")
+    return True
 
 
-def export_text_decoder(model, processor, output_dir: Path, dummy_inputs):
-    """Export the text decoder (language model) to ONNX."""
-    print("[*] Exporting text decoder...")
+def _export_language_model(model, processor, onnx_dir: Path, torch_dtype) -> bool:
+    """Export the language model with a simple forward pass."""
+    import torch
 
-    class DecoderWrapper(torch.nn.Module):
-        def __init__(self, model):
+    class LMWrapper(torch.nn.Module):
+        def __init__(self, m):
             super().__init__()
-            self.lm = model
+            self.m = m
 
-        def forward(self, input_ids, attention_mask, pixel_values):
-            out = self.lm(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                pixel_values=pixel_values,
-            )
+        def forward(self, input_ids, attention_mask):
+            out = self.m(input_ids=input_ids, attention_mask=attention_mask)
             return out.logits
 
-    wrapper = DecoderWrapper(model)
-    wrapper.eval()
+    try:
+        wrapper = LMWrapper(model).eval()
+        dummy_ids = torch.ones(1, 16, dtype=torch.long)
+        dummy_mask = torch.ones(1, 16, dtype=torch.long)
 
-    # Get properly shaped dummy inputs
-    with torch.no_grad():
-        try:
-            onnx_path = output_dir / "decoder_model.onnx"
-            inputs = dummy_inputs
-            pixel_values = inputs.get("pixel_values", torch.zeros(1, 3, 448, 448))
-            input_ids = inputs["input_ids"][:, :32]  # Truncate for faster export
-            attention_mask = inputs["attention_mask"][:, :32]
-
+        onnx_path = onnx_dir / "decoder_model.onnx"
+        with torch.no_grad():
             torch.onnx.export(
                 wrapper,
-                (input_ids, attention_mask, pixel_values),
+                (dummy_ids, dummy_mask),
                 str(onnx_path),
-                input_names=["input_ids", "attention_mask", "pixel_values"],
+                input_names=["input_ids", "attention_mask"],
                 output_names=["logits"],
                 dynamic_axes={
-                    "input_ids": {0: "batch", 1: "seq_len"},
-                    "attention_mask": {0: "batch", 1: "seq_len"},
-                    "logits": {0: "batch", 1: "seq_len"},
+                    "input_ids": {0: "batch", 1: "seq"},
+                    "attention_mask": {0: "batch", 1: "seq"},
+                    "logits": {0: "batch", 1: "seq"},
                 },
                 opset_version=17,
                 do_constant_folding=True,
             )
-            print(f"[+] Decoder saved: {onnx_path} ({onnx_path.stat().st_size / 1e6:.1f} MB)")
-        except Exception as e:
-            print(f"[!] Decoder export failed with combined input. Trying alternate method: {e}")
-            raise
-
-
-def quantize_model(onnx_path: Path, quantize_mode: str = "int4") -> Path:
-    """Quantize ONNX model to reduce size."""
-    try:
-        from onnxruntime.quantization import quantize_dynamic, QuantType
-        print(f"[*] Quantizing {onnx_path.name} to {quantize_mode}...")
-        quant_path = onnx_path.parent / f"{onnx_path.stem}_{quantize_mode}.onnx"
-        quant_type = QuantType.QInt8 if quantize_mode == "int8" else QuantType.QInt4
-        quantize_dynamic(str(onnx_path), str(quant_path), weight_type=quant_type)
-        print(f"[+] Quantized: {quant_path} ({quant_path.stat().st_size / 1e6:.1f} MB)")
-        return quant_path
+        log(f"Decoder model: {onnx_path.name} ({fmt_mb(onnx_path)})", "OK")
+        return True
     except Exception as e:
-        print(f"[!] Quantization failed: {e}")
-        return onnx_path
+        log(f"LM export failed: {e}", "WARN")
+        return False
 
 
-def copy_config_files(model_id: str, output_dir: Path):
-    """Copy tokenizer and config files needed by transformers.js."""
-    print("[*] Copying tokenizer and config files...")
-    from huggingface_hub import snapshot_download
+# ── Download tokenizer files ────────────────────────────────────────────────
 
-    # Download only config/tokenizer files (not weights)
-    cache_dir = snapshot_download(
-        model_id,
-        ignore_patterns=["*.bin", "*.safetensors", "*.pt", "*.pth"],
-    )
-    for fname in [
-        "config.json",
-        "tokenizer.json",
-        "tokenizer_config.json",
-        "preprocessor_config.json",
-        "generation_config.json",
-        "special_tokens_map.json",
-        "chat_template.jinja",
-    ]:
-        src = Path(cache_dir) / fname
-        if src.exists():
-            shutil.copy(src, output_dir / fname)
-            print(f"  [+] Copied {fname}")
+def download_config_files(model_id: str, output_dir: Path) -> Path:
+    """Download tokenizer and config files (not weights) from HF Hub."""
+    log(f"Downloading tokenizer/config from {model_id}...")
+    try:
+        from huggingface_hub import snapshot_download
+        cache = snapshot_download(
+            model_id,
+            ignore_patterns=["*.bin", "*.safetensors", "*.pt", "*.pth", "*.gguf"],
+        )
+        cache_path = Path(cache)
+        copy_tokenizer_files(cache_path, output_dir)
+        patch_config_for_transformers_js(output_dir / "config.json")
+        return cache_path
+    except Exception as e:
+        log(f"Could not download config files: {e}", "WARN")
+        return Path()
 
-    # Patch config.json to add transformers.js hints
-    config_path = output_dir / "config.json"
-    if config_path.exists():
-        with open(config_path) as f:
-            cfg = json.load(f)
-        cfg["_transformers_js_config"] = {
-            "kv_cache_dtype": "float32",
-            "use_past": True,
-        }
-        with open(config_path, "w") as f:
-            json.dump(cfg, f, indent=2)
 
+# ── Push to Hub ─────────────────────────────────────────────────────────────
 
 def push_to_hub(output_dir: Path, repo_id: str):
     """Upload converted model to HuggingFace Hub."""
-    from huggingface_hub import HfApi
-    print(f"[*] Pushing to HuggingFace Hub: {repo_id}")
-    api = HfApi()
-    api.create_repo(repo_id=repo_id, exist_ok=True, repo_type="model")
-    api.upload_folder(
-        folder_path=str(output_dir),
-        repo_id=repo_id,
-        repo_type="model",
-    )
-    print(f"[+] Uploaded! View at: https://huggingface.co/{repo_id}")
+    log(f"Pushing to HuggingFace Hub: {repo_id}")
+    try:
+        from huggingface_hub import HfApi
+        api = HfApi()
+        api.create_repo(repo_id=repo_id, exist_ok=True, repo_type="model")
+        api.upload_folder(
+            folder_path=str(output_dir),
+            repo_id=repo_id,
+            repo_type="model",
+        )
+        log(f"Uploaded: https://huggingface.co/{repo_id}", "OK")
+    except Exception as e:
+        log(f"Hub push failed: {e}", "ERR")
+        raise
 
+
+# ── Main ────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="Convert GLM-OCR to ONNX for browser inference")
-    parser.add_argument("--model", default="zai-org/GLM-OCR", help="HuggingFace model ID")
-    parser.add_argument("--output", default="./onnx_output", help="Output directory")
-    parser.add_argument("--quantize", choices=["none", "int8", "int4"], default="int4")
-    parser.add_argument("--push_to_hub", default=None, help="HF repo ID to push to e.g. username/GLM-OCR-ONNX")
+    parser = argparse.ArgumentParser(
+        description="Convert GLM-OCR to ONNX for in-browser WebGPU inference"
+    )
+    parser.add_argument("--model",       default="zai-org/GLM-OCR")
+    parser.add_argument("--output",      default="./onnx_output")
+    parser.add_argument("--quantize",    default="int4", choices=["int4", "int8", "fp16", "fp32"])
+    parser.add_argument("--push_to_hub", default=None,
+                        help="HF repo ID to push to, e.g. username/GLM-OCR-ONNX")
+    parser.add_argument("--approach",    default="auto",
+                        choices=["auto", "optimum", "genai", "direct"],
+                        help="Which export approach to use")
     args = parser.parse_args()
 
     output_dir = Path(args.output)
     output_dir.mkdir(parents=True, exist_ok=True)
-    onnx_dir = output_dir / "onnx"
-    onnx_dir.mkdir(exist_ok=True)
 
+    print()
     print("=" * 60)
     print("  GLM-OCR → ONNX Converter")
+    print(f"  source : {args.model}")
+    print(f"  output : {output_dir}")
+    print(f"  dtype  : {args.quantize}")
     print("=" * 60)
-
-    # Load model
-    processor, model = load_model(args.model)
-
-    # Create dummy inputs
-    dummy_inputs, _ = create_dummy_inputs(processor)
-
-    # Export vision encoder
-    try:
-        ve_path = export_vision_encoder(model, processor, onnx_dir)
-        if args.quantize != "none":
-            quantize_model(ve_path, args.quantize)
-    except Exception as e:
-        print(f"[!] Vision encoder export failed: {e}")
-
-    # Export decoder
-    try:
-        export_text_decoder(model, processor, onnx_dir, dummy_inputs)
-    except Exception as e:
-        print(f"[!] Decoder export failed: {e}")
-        print("[i] Note: Full autoregressive decoder export requires custom handling.")
-        print("[i] See: https://github.com/microsoft/onnxruntime-genai for genai export")
-
-    # Copy config files
-    try:
-        copy_config_files(args.model, output_dir)
-    except Exception as e:
-        print(f"[!] Config copy failed: {e}")
-
-    print("\n" + "=" * 60)
-    print(f"[+] Conversion complete. Output: {output_dir}")
     print()
-    print("Next steps:")
-    print(f"  1. Upload to HF Hub: python convert_to_onnx.py --push_to_hub YOUR_USERNAME/GLM-OCR-ONNX")
-    print(f"  2. Or host ONNX files locally and set MODEL_URL in the app")
-    print("=" * 60)
 
-    if args.push_to_hub:
-        push_to_hub(output_dir, args.push_to_hub)
+    # Download tokenizer/config first (small, always works)
+    download_config_files(args.model, output_dir)
+
+    # Run conversion approaches
+    success = False
+    approaches = {
+        "optimum": lambda: try_optimum_export(args.model, output_dir, args.quantize),
+        "genai":   lambda: try_onnxruntime_genai(args.model, output_dir, args.quantize),
+        "direct":  lambda: try_direct_export(args.model, output_dir, args.quantize),
+    }
+
+    if args.approach == "auto":
+        order = ["optimum", "genai", "direct"]
+    else:
+        order = [args.approach]
+
+    for name in order:
+        log(f"\n{'─' * 50}")
+        log(f"Trying: {name}")
+        log(f"{'─' * 50}")
+        try:
+            if approaches[name]():
+                success = True
+                log(f"✓ Approach '{name}' succeeded!", "OK")
+                break
+            else:
+                log(f"✗ Approach '{name}' produced no output", "WARN")
+        except Exception as e:
+            log(f"✗ Approach '{name}' crashed: {e}", "WARN")
+            if os.environ.get("DEBUG"):
+                traceback.print_exc()
+
+    print()
+    print("=" * 60)
+    if success:
+        # List output
+        log("Conversion complete. Output files:", "OK")
+        for f in sorted(output_dir.rglob("*")):
+            if f.is_file():
+                print(f"  {fmt_mb(f):>10}  {f.relative_to(output_dir)}")
+
+        if args.push_to_hub:
+            print()
+            push_to_hub(output_dir, args.push_to_hub)
+        else:
+            print()
+            log("To push to HuggingFace Hub, re-run with: --push_to_hub USERNAME/GLM-OCR-ONNX")
+    else:
+        log("All approaches failed. The model may need manual conversion.", "ERR")
+        log("Options:", "ERR")
+        log("  1. Open an issue on https://github.com/huggingface/optimum", "ERR")
+        log("  2. Check onnxruntime-genai support for new model types", "ERR")
+        log("  3. Set DEBUG=1 and re-run for full tracebacks", "ERR")
+        sys.exit(1)
+
+    print("=" * 60)
+    print()
 
 
 if __name__ == "__main__":
