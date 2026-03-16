@@ -63,8 +63,9 @@ jobs:
           pip install "optimum[onnxruntime]"
           pip install "transformers==5.3.0" --force-reinstall
 
-          # ONNX toolchain (onnx-ir needed by onnxruntime-genai builder)
-          pip install onnx "onnxruntime>=1.20" onnxconverter-common onnx-ir
+          # ONNX toolchain — onnxscript is required by torch 2.5+'s default
+          # dynamo-based torch.onnx.export (without it export raises ModuleNotFoundError)
+          pip install onnx "onnxruntime>=1.20" onnxconverter-common onnxscript
 
           # Fast HF Hub downloads
           pip install "huggingface_hub[hf_transfer]" hf_transfer
@@ -88,10 +89,14 @@ jobs:
           HF_HUB_ENABLE_HF_TRANSFER: "1"
           HF_HOME: /tmp/hf_cache
         run: |
+          # Use --approach direct: optimum is incompatible with transformers 5.3.0
+          # (get_parameter_dtype removed), and onnxruntime-genai explicitly says
+          # "The zai-org/GLM-OCR model is not currently supported."
           python conversion/convert_to_onnx.py \
             --model "${{ inputs.source_model }}" \
             --output ./onnx_output \
             --quantize "${{ inputs.dtype }}" \
+            --approach direct \
             --push_to_hub "${{ inputs.hf_repo_id }}"
 
       # ── Upload artifact (backup if push fails) ────────────────────────────

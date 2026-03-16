@@ -270,7 +270,10 @@ def try_direct_export(
             log("glm_ocr not in CONFIG_MAPPING — transformers too old, skipping", "WARN")
             return False
 
-        torch_dtype = torch.float16 if dtype in ("fp16", "int4", "int8") else torch.float32
+        # Always load as float32 for export — float16 on CPU is unstable with
+        # torch.onnx.export and doesn't reduce export time. Quantization
+        # (int4/int8) happens after export via onnxruntime.quantization.
+        torch_dtype = torch.float32
 
         log(f"Loading model {model_id} (dtype={torch_dtype})...")
 
