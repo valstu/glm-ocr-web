@@ -52,21 +52,31 @@ jobs:
       - name: Install Python dependencies
         run: |
           pip install --upgrade pip
-          # Core ML stack
-          pip install "transformers>=5.3.0"
-          # CPU-only torch (smaller, no CUDA needed for export)
+
+          # CPU-only torch first (smaller download, no CUDA needed for export)
           pip install torch --index-url https://download.pytorch.org/whl/cpu
-          # ONNX toolchain
-          pip install onnx "onnxruntime>=1.20" onnxconverter-common
-          # optimum with ONNX exporters
+
+          # Install optimum first, then force-upgrade transformers so optimum
+          # can't downgrade it. glm_ocr support landed in transformers 5.3.0
+          # which may not be on PyPI yet — install from source to be safe.
           pip install "optimum[onnxruntime]"
+          pip install git+https://github.com/huggingface/transformers.git
+
+          # ONNX toolchain (onnx-ir needed by onnxruntime-genai builder)
+          pip install onnx "onnxruntime>=1.20" onnxconverter-common onnx-ir
+
           # Fast HF Hub downloads
           pip install "huggingface_hub[hf_transfer]" hf_transfer
-          pip install Pillow numpy
-          # Check versions
-          python -c "import transformers; print('transformers:', transformers.__version__)"
+          pip install Pillow numpy accelerate
+
+          # Verify glm_ocr is registered in this transformers build
+          python -c "
+          import transformers
+          print('transformers:', transformers.__version__)
+          from transformers import CONFIG_MAPPING
+          print('glm_ocr in transformers:', 'glm_ocr' in CONFIG_MAPPING)
+          "
           python -c "import onnx; print('onnx:', onnx.__version__)"
-          python -c "import optimum; print('optimum installed')"
 
       # ── Run conversion ────────────────────────────────────────────────────
       - name: Convert GLM-OCR to ONNX

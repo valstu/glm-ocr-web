@@ -203,7 +203,7 @@ def try_onnxruntime_genai(
         if result.returncode != 0:
             log("onnxruntime-genai not installed, installing...", "WARN")
             subprocess.run(
-                [sys.executable, "-m", "pip", "install", "onnxruntime-genai", "-q"],
+                [sys.executable, "-m", "pip", "install", "onnxruntime-genai", "onnx-ir", "-q"],
                 check=True,
             )
 
@@ -259,12 +259,39 @@ def try_direct_export(
     log("Approach 3: Direct torch.onnx.export")
     try:
         import torch
-        from transformers import AutoProcessor, AutoModelForImageTextToText
+        from transformers import (
+            AutoProcessor,
+            AutoModelForImageTextToText,
+            AutoConfig,
+        )
+
+        # Verify glm_ocr is known to this transformers install
+        from transformers import CONFIG_MAPPING
+        if "glm_ocr" not in CONFIG_MAPPING:
+            log("glm_ocr not in CONFIG_MAPPING — transformers too old, skipping", "WARN")
+            return False
 
         torch_dtype = torch.float16 if dtype in ("fp16", "int4", "int8") else torch.float32
 
         log(f"Loading model {model_id} (dtype={torch_dtype})...")
-        processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
+
+        # Load processor — try multiple strategies
+        processor = None
+        for kwargs in [
+            {"trust_remote_code": True},
+            {"trust_remote_code": False},
+        ]:
+            try:
+                processor = AutoProcessor.from_pretrained(model_id, **kwargs)
+                log(f"Processor loaded (trust_remote_code={kwargs['trust_remote_code']})", "OK")
+                break
+            except Exception as e:
+                log(f"Processor load attempt failed: {e}", "WARN")
+
+        if processor is None:
+            log("Could not load processor", "ERR")
+            return False
+
         model = AutoModelForImageTextToText.from_pretrained(
             model_id,
             torch_dtype=torch_dtype,
