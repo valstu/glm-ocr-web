@@ -53,14 +53,15 @@ jobs:
         run: |
           pip install --upgrade pip
 
-          # CPU-only torch first (smaller download, no CUDA needed for export)
-          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          # CPU-only torch + torchvision (GLM-OCR processor needs torchvision)
+          pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
 
-          # Install optimum first, then force-upgrade transformers so optimum
-          # can't downgrade it. glm_ocr support landed in transformers 5.3.0
-          # which may not be on PyPI yet — install from source to be safe.
+          # Install optimum first, then pin transformers to 5.3.0 which:
+          #   a) has glm_ocr in CONFIG_MAPPING
+          #   b) still exports get_parameter_dtype (removed in 5.4+)
+          # Using --force-reinstall ensures optimum doesn't silently downgrade it.
           pip install "optimum[onnxruntime]"
-          pip install git+https://github.com/huggingface/transformers.git
+          pip install "transformers==5.3.0" --force-reinstall
 
           # ONNX toolchain (onnx-ir needed by onnxruntime-genai builder)
           pip install onnx "onnxruntime>=1.20" onnxconverter-common onnx-ir
@@ -69,14 +70,16 @@ jobs:
           pip install "huggingface_hub[hf_transfer]" hf_transfer
           pip install Pillow numpy accelerate
 
-          # Verify glm_ocr is registered in this transformers build
+          # Verify glm_ocr is registered
           python -c "
           import transformers
           print('transformers:', transformers.__version__)
           from transformers import CONFIG_MAPPING
-          print('glm_ocr in transformers:', 'glm_ocr' in CONFIG_MAPPING)
+          assert 'glm_ocr' in CONFIG_MAPPING, 'glm_ocr NOT found — wrong transformers version!'
+          print('glm_ocr: OK')
+          import torchvision; print('torchvision:', torchvision.__version__)
+          import onnx; print('onnx:', onnx.__version__)
           "
-          python -c "import onnx; print('onnx:', onnx.__version__)"
 
       # ── Run conversion ────────────────────────────────────────────────────
       - name: Convert GLM-OCR to ONNX

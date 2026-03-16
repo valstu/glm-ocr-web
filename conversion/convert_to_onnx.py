@@ -226,7 +226,6 @@ def try_onnxruntime_genai(
                 "-o", str(genai_output),
                 "-p", precision,
                 "-e", "cpu",
-                "--trust_remote_code",
             ],
             capture_output=True,
             text=True,
